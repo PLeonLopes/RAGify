@@ -12,6 +12,7 @@ from langchain.embeddings import HuggingFaceEmbeddings          # nomic-embed
 from langchain.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
 
 from html_templates import css, user_template, bot_template
 
@@ -77,9 +78,34 @@ def get_conversation_chain(vectorstore):
 
     llm = ChatOllama(model="llama3", temperature=0.1)           # Using llama3
 
-    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
+    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)          # Conversation Memory
+
+    # Prompt Template
+    CUSTOM_PROMPT_TEMPLATE = """
+    You are a highly specialized AI assistant, tasked with answering questions based on documents provided by the user.
+    Your goal is to provide **accurate**, **clear**, and **strictly information-based answers** extracted from the uploaded files.
+    If the answer cannot be found in the documents, **admit that you do not know** rather than inventing a response.
+    You may use information from multiple documents. If the information is not directly connected, state this clearly.
+    Always respond in **English**, even if the documents or the question are in another language.
+    ---
+    Conversation history:
+    {chat_history}
+
+    User question:
+    {question}
+
+    Document context:
+    {context}
+
+    Answer:
+    """
+
+    prompt = PromptTemplate(
+        template=CUSTOM_PROMPT_TEMPLATE,
+        input_variables=["chat_history", "question", "context"]
+    )
     
-    conversation_chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(), memory=memory)
+    conversation_chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(), memory=memory, combine_docs_chain_kwargs={"prompt": prompt})
     return conversation_chain
 
 

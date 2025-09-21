@@ -1,160 +1,186 @@
 import streamlit as st
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from docx import Document
-import openpyxl
-import csv
-import io
+import os
 
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.chat_models import ChatOllama
-from langchain.embeddings import HuggingFaceEmbeddings          # nomic-embed
-from langchain.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
+
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from html_templates import css, user_template, bot_template
+import database
+from utils import extract_text_from_files, get_text_chunks, get_conversation_chain, get_vectorstore
+from ui_handlers import display_auth_ui, handle_user_input, display_uploaded_files_ui, handle_file_removal_logic
 
-# Data Collection (Multiple Files -> text)
-def extract_text_from_files(uploaded_files):
+FAISS_INDEX_NAME = "index"          # FAISS index (Const)
 
-    text = ""
-    for file in uploaded_files:
-        filename = file.name.lower()
-
-        # .pdf extraction
-        if filename.endswith(".pdf"):
-            pdf_reader = PdfReader(file)
-            for page in pdf_reader.pages:
-                text += page.extract_text() or ""
-
-        # .docx extraction
-        elif filename.endswith(".docx"):
-            doc = Document(file)
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-        
-        # .xlsx extraction
-        elif filename.endswith(".xlsx"):
-            wb = openpyxl.load_workbook(file, data_only=True)
-            for sheet in wb.worksheets:
-                for row in sheet.iter_rows(values_only=True):
-                    text += ' '.join([str(cell) if cell is not None else '' for cell in row]) + "\n"
-        
-        # .csv extraction
-        elif filename.endswith(".csv"):
-            decoded = file.read().decode("utf-8")
-            reader = csv.reader(io.StringIO(decoded))
-            for row in reader:
-                text += ' | '.join(row) + "\n"
-
-        # .txt/.md extraction
-        elif filename.endswith(".txt") or filename.endswith(".md"):
-            text += file.read().decode("utf-8") + "\n"
-
-        else:
-            text += f"\n[Unsupported file format: {file.name}]\n"
-    return text
-
-
-# Data chunking
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(separator="\n", chunk_size=1000, chunk_overlap=200, length_function=len)
-    chunks = text_splitter.split_text(text)
-    return chunks
-
-
-# Document embeddings / "Vectorstore" creation (FAISS)
-def get_vectorstore(text_chunks):
-    embeddings = HuggingFaceEmbeddings(model_name="nomic-ai/nomic-embed-text-v1", model_kwargs={"trust_remote_code": True})         # Using nomic-embed-text-v1
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-
-    return vectorstore
-
-
-# "Conversation Chain" creation
-def get_conversation_chain(vectorstore):
-
-    llm = ChatOllama(model="llama3", temperature=0.1)           # Using llama3
-
-    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)          # Conversation Memory
-
-    # Prompt Template
-    CUSTOM_PROMPT_TEMPLATE = """
-    You are a highly specialized AI assistant, tasked with answering questions based on documents provided by the user.
-    Your goal is to provide **accurate**, **clear**, and **strictly information-based answers** extracted from the uploaded files.
-    If the answer cannot be found in the documents, **admit that you do not know** rather than inventing a response.
-    You may use information from multiple documents. If the information is not directly connected, state this clearly.
-    Always respond in **English**, even if the documents or the question are in another language.
-    ---
-    Conversation history:
-    {chat_history}
-
-    User question:
-    {question}
-
-    Document context:
-    {context}
-
-    Answer:
-    """
-
-    prompt = PromptTemplate(
-        template=CUSTOM_PROMPT_TEMPLATE,
-        input_variables=["chat_history", "question", "context"]
-    )
-    
-    conversation_chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(), memory=memory, combine_docs_chain_kwargs={"prompt": prompt})
-    return conversation_chain
-
-
-def handle_userInput(user_question):
-    response = st.session_state.conversation({'question' : user_question})
-    st.session_state.chat_history = response['chat_history']
-
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-        else:
-            st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-
- 
 def main():
     load_dotenv()
-
     st.set_page_config(page_title="RAGify - Chat", page_icon=":books:")
-
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
-
     st.write(css, unsafe_allow_html=True)
 
-    st.header("RAGify - Multiple Files :books:")
-    user_question = st.text_input("Ask a question about your documents: ")
-    if user_question:
-        handle_userInput(user_question)
+    if "conversation" not in st.session_state: st.session_state.conversation = None
+    if "chat_history" not in st.session_state: st.session_state.chat_history = []
+    if "vectorstore_loaded_for_user" not in st.session_state: st.session_state.vectorstore_loaded_for_user = False
+    if "processed_files_session" not in st.session_state: st.session_state.processed_files_session = []
 
-    with st.sidebar:
-        st.subheader("Your files: ")
+    display_auth_ui()           # Sign UP/Login Sidear -> ui_handlers
 
-        docs = st.file_uploader("Upload your documents and click Process (.pdf, .docx, .xlsx, .csv, .txt, .md)", accept_multiple_files=True)
+    if st.session_state.get("logged_in_user_id") and (st.session_state.conversation is None or not st.session_state.vectorstore_loaded_for_user):
+        with st.spinner("Carregando dados do usuário..."):
+            user_id = st.session_state.logged_in_user_id
+            loaded_chat_history_messages = []
+            db_history_tuples = database.load_chat_history(user_id)
+            if db_history_tuples:
+                for u_msg, ai_msg in db_history_tuples:
+                    if u_msg: loaded_chat_history_messages.append(HumanMessage(content=u_msg))
+                    if ai_msg: loaded_chat_history_messages.append(AIMessage(content=ai_msg))
+            st.session_state.chat_history = loaded_chat_history_messages 
 
-        if st.button("Process"):
-            with st.spinner("Processing"):
-                # gets pdf text
-                raw_text = extract_text_from_files(docs)
-
-                # get text chunks
-                text_chunks = get_text_chunks(raw_text)
-
-                # Embeddings / Vectorstore (FAISS)
-                vectorstore = get_vectorstore(text_chunks)
+            # VectorStore usage
+            vectorstore = get_vectorstore(
+                user_id=user_id, db_get_user_faiss_path_func=database.get_user_faiss_path,
+                faiss_index_name_const=FAISS_INDEX_NAME, session_state=st.session_state, st_feedback_obj=st
+            )
+            if vectorstore:
+                st.session_state.conversation = get_conversation_chain(vectorstore, initial_chat_history=st.session_state.chat_history)
                 
-                # Creates "conversation chain"
-                st.session_state.conversation = get_conversation_chain(vectorstore)
+                if not st.session_state.vectorstore_loaded_for_user : 
+                     st.success("Conhecimento anterior carregado. Pronto para conversar!")
+                st.session_state.vectorstore_loaded_for_user = True
+            else:
+                st.session_state.vectorstore_loaded_for_user = False
+
+    st.header("RAGify - Ask questions about your documents")
+    
+    # IF chat_history
+    if st.session_state.chat_history:
+        st.subheader("Chat History:")
+        # Shows chat history, using template (html_templates.py)
+        for i, message in enumerate(st.session_state.chat_history):
+            msg_content = getattr(message, 'content', str(message))
+            if isinstance(message, HumanMessage) or (i % 2 == 0 and not isinstance(message, AIMessage)):            # USER message
+                st.write(user_template.replace("{{MSG}}", msg_content), unsafe_allow_html=True)
+            elif isinstance(message, AIMessage) or (i % 2 != 0):                                                    # LLM message
+                st.write(bot_template.replace("{{MSG}}", msg_content), unsafe_allow_html=True)
+        st.markdown("---")
+
+    # User Input
+    with st.form(key="chat_input_form", clear_on_submit=True):
+        user_question_typed = st.text_input("Ask a question about your documents:", key="user_question_input_field")
+        submitted = st.form_submit_button("Send")
+
+    # Processing the questionn 
+    if submitted and user_question_typed: 
+        if st.session_state.conversation:
+            with st.spinner("Thinking... 🧠"):
+                handle_user_input(
+                    user_question_typed,
+                    get_conversation_chain_func=get_conversation_chain,
+                    save_chat_message_func=database.save_chat_message
+                )
+            st.rerun() 
+        else:
+            st.warning("Please upload some files or log in to load your knowledge.")
+
+    # Sidebar (File upload)
+    with st.sidebar:
+        uploader_key = f"file_uploader_{st.session_state.get('logged_in_user_id', 'guest')}"
+        
+        pdf_docs = st.file_uploader(
+            "Upload new files and click Process",
+            accept_multiple_files=True,
+            type=["pdf", "docx", "xlsx", "csv", "txt", "md"],
+            key=uploader_key
+        )
+
+        # Processing of new files
+        if st.button("Process Files 📂", key="process_button"):
+            if pdf_docs:
+                with st.spinner("Processing Files... ⚙️"):
+                    current_user_id = st.session_state.get("logged_in_user_id")
+                    if not current_user_id:
+                        st.session_state.processed_files_session = [] 
+                        for doc in pdf_docs:
+                            doc_bytes = doc.getvalue() 
+                            st.session_state.processed_files_session.append(
+                                {'name': doc.name, 'id': doc.name, 'bytes': doc_bytes}
+                            )
+                            doc.seek(0)
+                    
+                    raw_text = extract_text_from_files(pdf_docs)
+                    text_chunks = []
+
+                    if not raw_text or not raw_text.strip():
+                        st.warning("No text extracted from the files. Check the formats or content.")            # File format no supported
+                    else:
+                        text_chunks = get_text_chunks(raw_text)
+
+                    # VectorStore usage                                  
+                    vectorstore = get_vectorstore(
+                        text_chunks=text_chunks if text_chunks else None, 
+                        user_id=current_user_id,
+                        db_get_user_faiss_path_func=database.get_user_faiss_path,
+                        faiss_index_name_const=FAISS_INDEX_NAME,
+                        session_state=st.session_state,
+                        st_feedback_obj=st
+                    )
+
+                    if vectorstore: 
+                        chat_hist_for_chain = [] 
+                        if current_user_id: 
+                            db_history_tuples = database.load_chat_history(current_user_id)         # conversation_chain fetching chat history
+                            if db_history_tuples:
+                                for u_msg, ai_msg in db_history_tuples:
+                                    if u_msg: chat_hist_for_chain.append(HumanMessage(content=u_msg))           # USER messages
+                                    if ai_msg: chat_hist_for_chain.append(AIMessage(content=ai_msg))            # LLM messages
+                        st.session_state.chat_history = chat_hist_for_chain
+                        
+                        st.session_state.conversation = get_conversation_chain(
+                            vectorstore, initial_chat_history=st.session_state.chat_history
+                        )
+                        st.session_state.vectorstore_loaded_for_user = True
+                        
+                        if current_user_id:
+                            user_faiss_dir_path = database.get_user_faiss_path(current_user_id)
+                            # Add it to DB
+                            for doc in pdf_docs: 
+                                database.add_user_file_record(current_user_id, doc.name, user_faiss_dir_path)
+                            st.success("Files processed and knowledge saved/updated!")
+                        else:
+                            st.success("Files processed for this session!")
+                        st.rerun()
+                    elif current_user_id and not text_chunks and \
+                         not (database.get_user_faiss_path(current_user_id) and \
+                              os.path.exists(os.path.join(database.get_user_faiss_path(current_user_id), f"{FAISS_INDEX_NAME}.faiss"))):
+                         st.warning("No text processed from the files and no previous knowledge found.")
+                         st.session_state.conversation = None 
+                         st.session_state.vectorstore_loaded_for_user = False
+                    elif current_user_id and not text_chunks: 
+                        st.info("No new files processed. Previous knowledge (if any) is active.")
+                    else: 
+                        if not current_user_id and not text_chunks:                     # User logged in without text (edge-case)
+                             st.warning("No text available for this session.")
+                        else:
+                            st.error("There was a failure creating or loading the vector knowledge base. Please try again later.")
+                        st.session_state.conversation = None
+                        st.session_state.vectorstore_loaded_for_user = False
+            else:
+                st.warning("Please upload at least one file.")
+        
+        # UI to display uploaded files (using helper functions) -> Refactor ASAP! 
+        display_uploaded_files_ui(handle_file_removal_func=lambda file_id, file_name, source: handle_file_removal_logic(
+                file_id, file_name, source, FAISS_INDEX_NAME,
+                lambda **kwargs: get_vectorstore(
+                    db_get_user_faiss_path_func=database.get_user_faiss_path,
+                    faiss_index_name_const=FAISS_INDEX_NAME,
+                    session_state=st.session_state,
+                    st_feedback_obj=st,
+                    **kwargs
+                ), 
+                get_conversation_chain 
+            ),
+            faiss_index_name_const=FAISS_INDEX_NAME
+        )
 
 if __name__ == '__main__':
     main()

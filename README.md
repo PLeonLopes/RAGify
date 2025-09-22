@@ -14,7 +14,7 @@ The diagram below illustrates the flow of the application, from user login to do
 
 | <center>Application Flow</center> |
 |------------------|
-| <img src="docs/flow-RAGify.png" width="100%"/> |
+| <img src="./docs/flow-RAGify.PNG" width="100%"/> |
 
 ---
 
